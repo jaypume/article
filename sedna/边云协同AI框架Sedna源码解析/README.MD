@@ -78,6 +78,16 @@ Sedna的边云协同基于KubeEdge提供的如下能力实现
 
 
 
+> *The following components form the three main parts of an operator:*
+>
+> - *API*: The data that describes the operand’s configuration. The API includes:
+>   - ***Custom resource definition (CRD)***, which defines a schema of settings available for configuring the operand.
+>   - ***Programmatic API***, which defines the same data schema as the CRD and is implemented using the operator’s programming language, such as [*Go*](https://developers.redhat.com/blog/category/go/)*.*
+>   - ***Custom resource (CR)***, which specifies values for the settings defined by the CRD; these values describe the configuration of an operand.
+> - ***Controller***: The brains of the operator. The controller creates managed resources based on the description in the custom resource; controllers are implemented using the operator’s programming language, such as Go. [^2]
+
+
+
 组件构成了operator的主要部分
 
 ![Sedna](./images/Sedna源码结构.jpg)
@@ -894,4 +904,4 @@ minio
 
 
 [^1]: https://www.redhat.com/en/topics/containers/what-is-a-kubernetes-operator
-[^2]: 
+[^2]: https://developers.redhat.com/articles/2021/06/22/kubernetes-operators-101-part-2-how-operators-work
