@@ -1,4 +1,4 @@
-# KubeEdge-Sedna概述
+# ge-Sedna概述
 
 Sedna是在KubeEdge SIG AI中孵化的一个边云协同AI项目。得益于KubeEdge提供的边云协同能力，Sedna可以实现跨边云的协同训练和协同推理能力，如联合推理、增量学习、联邦学习、终身学习等。Sedna支持目前广泛使用的AI框架，如TensorFlow/Pytorch/MindSpore等，现有AI类应用可以无缝迁移到Sedna, 快速实现边云协同的训练和推理，可在降低成本、提升模型性能、保护数据隐私等方面获得提升。
 
@@ -1047,6 +1047,255 @@ func (s *Server) messageHandler(request *restful.Request, response *restful.Resp
 
 
 # Sedna Lib源码解析（Python）
+
+Lib是面向AI开发者和应用开发者的Python 库，方便开发者把自己已有的代码改造成边云协同的。
+
+下面是Lib的工程目录结构：
+
+```shell
+➜  sedna tree lib -L 2
+lib
+├── __init__.py
+├── MANIFEST.in
+├── OWNERS
+├── requirements.dev.txt
+├── requirements.txt	// Sedna Python的依赖
+├── sedna
+│   ├── algorithms  // 边云协同算法
+│   ├── backend		// 支持的后端，tensorflow/pytorch
+│   ├── common
+│   ├── core		// 主要特性的实现逻辑
+│   ├── datasources // 支持的数据源格式，比如txt、csv等
+│   ├── __init__.py
+│   ├── README.md
+│   ├── service		// 需要启动server的组件，比如kb等
+│   ├── VERSION
+│   └── __version__.py
+└── setup.py
+```
+
+下面摘取每个部分比较典型的代码进行分析讲解。
+
+### core
+
+core部分主要是封装了用户的回调函数，比如下面的train，主要是回调用户封装的tensorflow、pytorch、mindspore的train函数。
+
+* 配置后处理函数。
+* 调用云端知识库进行训练、推理等。
+* 更新云端知识库。在终身学习中，云端知识库用来保存新的模型和样本，会被不断更新。
+* 将当前训练任务执行的情况发送给LC，比如训练任务是否完成、训练后的指标是多少。
+
+`lib/sedna/core/lifelong_learning/lifelong_learning.py`
+
+```python
+def train(self, train_data,
+          valid_data=None,
+          post_process=None,
+          **kwargs):
+    is_completed_initilization = \
+        str(Context.get_parameters("HAS_COMPLETED_INITIAL_TRAINING",
+                                   "false")).lower()
+
+    if is_completed_initilization == "true":
+        return self.update(train_data,
+                           valid_data=valid_data,
+                           post_process=post_process,
+                           **kwargs)
+
+    # 配置后处理函数
+    callback_func = None
+    if post_process is not None:
+        callback_func = ClassFactory.get_cls(
+            ClassType.CALLBACK, post_process)
+    res, seen_task_index = \
+        self.cloud_knowledge_management.seen_estimator.train(
+            train_data=train_data,
+            valid_data=valid_data,
+            **kwargs
+        ) 
+
+    # 调用云端知识库进行训练、或推理
+    unseen_res, unseen_task_index = \
+        self.cloud_knowledge_management.unseen_estimator.train()
+
+    # 更新云端知识库
+    task_index = dict(
+        seen_task=seen_task_index,
+        unseen_task=unseen_task_index)
+    task_index_url = FileOps.dump(
+        task_index, self.cloud_knowledge_management.local_task_index_url)
+
+    task_index = self.cloud_knowledge_management.update_kb(task_index_url)
+    res.update(unseen_res)
+
+    ...
+    
+    # 将当前训练任务执行的情况发送给LC，比如训练任务是否完成、训练后的指标是多少
+    self.report_task_info(
+            None, K8sResourceKindStatus.COMPLETED.value, task_info_res)
+        self.log.info(f"Lifelong learning Train task Finished, "
+                      f"KB index save in {task_index}")
+        return callback_func(self.estimator, res) if callback_func else res
+    
+    ...
+```
+
+### backend
+
+`MSBackend`这里定义了一种Sedna支持的后端框架Mindspore，如果对于某个框架定义好典型的train、predict、evaluate函数，那么Sedna Lib 将能够支持将其作为backend，能够实现把现有AI代码进行简单的封装即可实现边云协同的能力。
+
+`lib/sedna/backend/mindspore/__init__.py`
+
+```python
+class MSBackend(BackendBase):
+    def __init__(self, estimator, fine_tune=True, **kwargs):
+        super(MSBackend, self).__init__(estimator=estimator,
+                                        fine_tune=fine_tune,
+                                        **kwargs)
+        self.framework = "mindspore"
+        if self.use_npu:
+            context.set_context(mode=context.GRAPH_MODE,
+                                device_target="Ascend")
+        elif self.use_cuda:
+            context.set_context(mode=context.GRAPH_MODE,
+                                device_target="GPU")
+        else:
+            context.set_context(mode=context.GRAPH_MODE,
+                                device_target="CPU")
+
+        if callable(self.estimator):
+            self.estimator = self.estimator()
+
+    def train(self, train_data, valid_data=None, **kwargs):
+        if callable(self.estimator):
+            self.estimator = self.estimator()
+        if self.fine_tune and FileOps.exists(self.model_save_path):
+            self.finetune()
+        self.has_load = True
+        varkw = self.parse_kwargs(self.estimator.train, **kwargs)
+        return self.estimator.train(train_data=train_data,
+                                    valid_data=valid_data,
+                                    **varkw)
+
+    def predict(self, data, **kwargs):
+        if not self.has_load:
+            self.load()
+        varkw = self.parse_kwargs(self.estimator.predict, **kwargs)
+        return self.estimator.predict(data=data, **varkw)
+
+    def evaluate(self, data, **kwargs):
+        if not self.has_load:
+            self.load()
+        varkw = self.parse_kwargs(self.estimator.evaluate, **kwargs)
+        return self.estimator.evaluate(data, **varkw)
+```
+
+### datasource
+
+datasource中封装了常用的数据集格式处理函数，这样就不需要通过
+
+`lib/sedna/datasources/__init__.py`
+
+```python
+class CSVDataParse(BaseDataSource, ABC):
+    """
+    csv file which contain Structured Data parser
+    """
+    # 提供了方便的数据集解析函数，
+    def parse(self, *args, **kwargs):
+        x_data = []
+        y_data = []
+        label = kwargs.pop("label") if "label" in kwargs else ""
+        usecols = kwargs.get("usecols", "")
+        if usecols and isinstance(usecols, str):
+            usecols = usecols.split(",")
+        if len(usecols):
+            if label and label not in usecols:
+                usecols.append(label)
+            kwargs["usecols"] = usecols
+        for f in args:
+            if isinstance(f, (dict, list)):
+                res = self.parse_json(f, **kwargs)
+            else:
+                if not (f and FileOps.exists(f)):
+                    continue
+                res = pd.read_csv(f, **kwargs)
+            if self.process_func and callable(self.process_func):
+                res = self.process_func(res)
+            if label:
+                if label not in res.columns:
+                    continue
+                y = res[label]
+                y_data.append(y)
+                res.drop(label, axis=1, inplace=True)
+            x_data.append(res)
+        if not x_data:
+            return
+        self.x = pd.concat(x_data)
+        self.y = pd.concat(y_data)
+```
+
+### algorithms
+
+Sedna面向边云协同AI场景，需要有针对这种场景下的算法。本身也集成了若干典型的难例识别算法，比如下面的交叉熵阈值的算法，能够在边侧模型不自信的时候识别到对应的样本。
+
+Sedna不仅是为了集成这些基础的算法，更是为了支持边云协同框架下能扩展更多实用的算法来优化边云整体训练、推理性能。这才是Sedna Lib的这套框架所希望实现的。
+
+`lib/sedna/algorithms/hard_example_mining/hard_example_mining.py`
+
+```python
+@ClassFactory.register(ClassType.HEM, alias="CrossEntropy")
+class CrossEntropyFilter(BaseFilter, abc.ABC):
+    """
+    **Object detection** Hard samples discovery methods named `CrossEntropy`
+
+    Parameters
+    ----------
+    threshold_cross_entropy: float
+        hard coefficient threshold score to filter img, default to 0.5.
+    """
+
+    def __init__(self, threshold_cross_entropy=0.5, **kwargs):
+        self.threshold_cross_entropy = float(threshold_cross_entropy)
+
+    def __call__(self, infer_result=None) -> bool:
+        """judge the img is hard sample or not.
+
+        Parameters
+        ----------
+        infer_result: array_like
+            prediction classes list, such as
+            [class1-score, class2-score, class2-score,....],
+            where class-score is the score corresponding to the class,
+            class-score value is in [0,1], who will be ignored if its
+            value not in [0,1].
+
+        Returns
+        -------
+        is hard sample: bool
+            `True` means hard sample, `False` means not.
+        """
+
+        if not infer_result:
+            # if invalid input, return False
+            return False
+
+        log_sum = 0.0
+        data_check_list = [class_probability for class_probability
+                           in infer_result
+                           if self.data_check(class_probability)]
+
+        if len(data_check_list) != len(infer_result):
+            return False
+
+        for class_data in data_check_list:
+            log_sum += class_data * math.log(class_data)
+        confidence_score = 1 + 1.0 * log_sum / math.log(
+            len(infer_result))
+        return confidence_score < self.threshold_cross_entropy
+```
+
+
 
 
 
