@@ -224,11 +224,12 @@ curl -k --cert ./client.crt --key ./client.key https://127.0.0.1:5443/apis/sedna
 
 下面是Sedna 终身学习CRD定义，一些需要关注的字段如下：
 
-- apiVersion: apiextensions.k8s.io/v1，当前所有的CRD都扩展自apiextensions.k8s.io/v1这个Version。
-- kind: CustomResourceDefinition，当前所有的CRD都继承自CustomResourceDefinition这个Kind。
-- spec.group: sedna.io，自定义资源的Group名称为sedna.io。
-- spec.names.kind: LifelongLearningJob, 自定义资源新增加的类型，这里是LifelongLearningJob。
-- spec.names.shortNames: - ll，在使用kubectl可以使用这个缩写”ll“查询到LifelongLearningJob资源。
+* `apiVersion: apiextensions.k8s.io/v1`，当前所有的CRD都扩展自apiextensions.k8s.io/v1这个Version。
+
+- `kind: CustomResourceDefinition`，当前所有的CRD都继承自CustomResourceDefinition这个Kind。
+- `spec.group: sedna.io`，自定义资源的Group名称为sedna.io。
+- `spec.names.kind: LifelongLearningJob`, 自定义资源新增加的类型，这里是LifelongLearningJob。
+- `spec.names.shortNames: - ll`，在使用kubectl可以使用这个缩写”ll“查询到LifelongLearningJob资源。
 
 `build/crds/sedna.io_lifelonglearningjobs.yaml`
 
