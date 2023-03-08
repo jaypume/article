@@ -312,11 +312,9 @@ type LLDataset struct {
 
 上面的代码片段中，补充了额外的说明，需要注意的有如下几点：
 
-| 代码片段                               | 说明                                                         |
-| -------------------------------------- | ------------------------------------------------------------ |
-| `// +kubebuilder...`                   | 注释是给kubebuilder等代码自动生成工具的配置参数，会被这些工具解析。 |
-| `type LifelongLearningJob struct{...}` | 定义了终身学习CRD整体API，主要包含Spec和Status定义，分别代表期望状态和实际状态。 |
-| `type LLJobSpec struct {...}`          | 在创建LifelongLearningJob CR时需要配置的参数；如果需要扩展终身学习字段的接口，可以在这里修改。 |
+- `// +kubebuilder...` ：注释是给kubebuilder等代码自动生成工具的配置参数，会被这些工具解析。
+- `type LifelongLearningJob struct{...}`：定义了终身学习CRD整体API，主要包含Spec和Status定义，分别代表期望状态和实际状态。
+- `type LLJobSpec struct {...}`：在创建LifelongLearningJob CR时需要配置的参数；如果需要扩展终身学习字段的接口，可以在这里修改。
 
 其他协同推理、增量学习、联邦学习相关的API定义都可以在`pkg/apis/sedna/v1alpha1/`这个目录下找到。
 
@@ -374,13 +372,133 @@ pkg/globalmanager/controllers/manager.go/Start() 【3】启动GM进程。
             -> pkg/globalmanager/controllers/lifelonglearning/downstream.go
         - f.SetUpstreamHandler()【9】
             -> pkg/globalmanager/controllers/lifelonglearning/upstream.go/updateFromEdge()
-        - f.Run()
-    - ws.ListenAndServe() 【10】
+        - f.Run()【10】
+    - ws.ListenAndServe() 【11】
 ```
 
 下面为了讲解Sedna LifelongLeraningJob Controller的控制逻辑，也按照上面1~10的标号来讲解：
 
-#### 【1】入口函数
+#### 【1】main函数入口
+
+`sedna-gm.go`是GM模块的启动入口，主要包括日志初始化配置、`app.NewControllerCommand()`中执行了参数的解析、启动GM对应的controller。
+
+`cmd/sedna-gm/sedna-gm.go`
+
+```go
+func main() {
+   rand.Seed(time.Now().UnixNano())
+
+   command := app.NewControllerCommand()
+   logs.InitLogs()
+   defer logs.FlushLogs()
+
+   if err := command.Execute(); err != nil {
+      os.Exit(1)
+   }
+}
+```
+
+#### 【2】GM加载系统配置
+
+GM加载系统配置，包括K8S集群配置、启动监听的Websocket地址端口、KB服务的地址等。
+
+`pkg/globalmanager/controllers/manager.go`
+
+```go
+// New creates the controller manager
+func New(cc *config.ControllerConfig) *Manager {
+   config.InitConfigure(cc)
+   return &Manager{
+      Config: cc,
+   }
+}
+```
+
+
+
+`pkg/globalmanager/config/config.go`
+
+```go
+// ControllerConfig indicates the config of controller
+type ControllerConfig struct {
+   // KubeAPIConfig indicates the kubernetes cluster info which controller will connected
+   KubeConfig string `json:"kubeConfig,omitempty"`
+
+   // Master indicates the address of the Kubernetes API server. Overrides any value in KubeConfig.
+   // such as https://127.0.0.1:8443
+   // default ""
+   Master string `json:"master"`
+   // Namespace indicates which namespace the controller listening to.
+   // default ""
+   Namespace string `json:"namespace,omitempty"`
+
+   // websocket server config
+   // Since the current limit of kubeedge(1.5), GM needs to build the websocket channel for communicating between GM and LCs.
+   WebSocket WebSocket `json:"websocket,omitempty"`
+
+   // lc config to info the worker
+   LC LCConfig `json:"localController,omitempty"`
+
+   // kb config to info the worker
+   KB KBConfig `json:"knowledgeBaseServer,omitempty"`
+
+   // period config min resync period
+   // default 30s
+   MinResyncPeriodSeconds int64 `json:"minResyncPeriodSeconds,omitempty"`
+}
+```
+
+#### 【3】GM整体初始化
+
+GM整体的初始化步骤如下，包括初始化Sedna CRD client、
+
+`pkg/globalmanager/controllers/manager.go`
+
+```go
+// Start starts the controllers it has managed
+func (m *Manager) Start() error {
+   ...
+   // 初始化Sedna CRD client，Controller会监听Sedna CR 增删改查的变化，并执行对应的处理逻辑。
+   sednaClient, err := clientset.NewForConfig(kubecfg)
+
+   ...
+   sednaInformerFactory := sednainformers.NewSharedInformerFactoryWithOptions(sednaClient, genResyncPeriod(minResyncPeriod), sednainformers.WithNamespace(namespace))
+
+   // 初始化UpstreamController，用于处理边缘LC上传的消息
+   uc, _ := NewUpstreamController(context)
+   downstreamSendFunc := messagelayer.NewContextMessageLayer().SendResourceObject
+   stopCh := make(chan struct{})
+   go uc.Run(stopCh)
+
+   // 针对每个特性（协同推理、终身学习等），绑定对应的消息处理函数
+   for name, factory := range NewRegistry() {
+      ...
+      f.SetDownstreamSendFunc(downstreamSendFunc)
+      f.SetUpstreamHandler(uc.Add)
+      ...
+      // 启动各个特性对应controller
+      go f.Run(stopCh)
+   }
+
+   ...
+
+   // 启动整体GM的websocket，默认监听在0.0.0.0:10004这个端口地址
+   ws := websocket.NewServer(addr)
+   ...
+}
+```
+
+#### 【4】初始化Sedna CRD client
+
+调用的原始函数位于`pkg/client/clientset/versioned/clientset.go`，前面提到这里是由client-go工具根据Sedna CRD定义自动生成的代码，方便
+
+
+
+pkg/globalmanager/controllers/lifelonglearning/lifelonglearningjob.go/addJobAnnotations()中会更新LifelongLearningJobs的状态，
+
+
+
+clientset.NewForConfig()：
 
 这里的client收到了
 
@@ -388,11 +506,47 @@ pkg/globalmanager/controllers/manager.go/Start() 【3】启动GM进程。
 
 
 
-#### 【2】加载配置文件
+#### 【5】初始化消息处理循环
 
-#### 【3】加载配置文件
+UpstreamController
 
-#### 【4】加载配置文件
+每个GM进程有一个UpstreamController
+
+NewUpstreamController()：
+
+启动一个for循环协程，来处理
+
+uc.Run(stopCh)：
+
+- pkg/globalmanager/controllers/upstream.go/syncEdgeUpdate() 
+
+#### 【6】Controller注册
+
+NewRegistry()：
+
+#### 【7】云端处理逻辑
+
+f.SetDownstreamSendFunc()
+
+-> pkg/globalmanager/controllers/lifelonglearning/downstream.go
+
+#### 【8】边缘消息同步
+
+f.SetUpstreamHandler()
+
+-> pkg/globalmanager/controllers/lifelonglearning/upstream.go/updateFromEdge()
+
+#### 【9】Controller核心处理逻辑
+
+f.Run()
+
+#### 【10】启动websocket监听
+
+#### ws.ListenAndServe() 
+
+
+
+#### 
 
 ### 消息同步
 
