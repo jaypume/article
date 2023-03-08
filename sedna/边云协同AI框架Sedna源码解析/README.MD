@@ -86,9 +86,9 @@ Sedna的边云协同基于KubeEdge提供的如下能力实现
 >   - ***Custom resource (CR)***, which specifies values for the settings defined by the CRD; these values describe the configuration of an operand.
 > - ***Controller***: The brains of the operator. The controller creates managed resources based on the description in the custom resource; controllers are implemented using the operator’s programming language, such as Go. [^2]
 
+通过上面Redhat的定义，我们可以看到组成一个k8s operator几个重要的概念包括 CRD、API、CR和Controller。
 
-
-组件构成了operator的主要部分
+下面是Sedna GM Operator的示意图：
 
 ![Sedna](./images/Sedna源码结构.jpg)
 
@@ -880,26 +880,175 @@ err = ws.ListenAndServe()
 
 ## LC: Local Controller
 
+LC是部署在边缘节点，主要负责本地的任务管理和消息代理。LC入口函数在`cmd/sedna-lc/sedna-lc.go`,相关入口分析可以参考GM章节。下面这里贴一下本地任务管理注册的函数入口：
+
+`cmd/sedna-lc/app/server.go`
+
+```go
+// runServer runs server
+func runServer() {
+   c := gmclient.NewWebSocketClient(Options)
+   if err := c.Start(); err != nil {
+      return
+   }
+
+   dm := dataset.New(c, Options)
+   mm := model.New(c)
+   jm := jointinference.New(c)
+   fm := federatedlearning.New(c)
+   im := incrementallearning.New(c, dm, mm, Options)
+   lm := lifelonglearning.New(c, dm, Options)
+   s := server.New(Options)
+
+   for _, m := range []managers.FeatureManager{
+      dm, mm, jm, fm, im, lm,
+   } {
+      s.AddFeatureManager(m)
+      c.Subscribe(m)
+      err := m.Start()
+      if err != nil {
+         klog.Errorf("failed to start manager %s: %v",
+            m.GetName(), err)
+         return
+      }
+      klog.Infof("manager %s is started", m.GetName())
+   }
+
+   s.ListenAndServe()
+}
+```
+
 ### 本地任务管理
 
-增量、联邦、xx等
+`Manager`这个对象负责了在边缘的任务管理，下面是其数据结构定义：
 
-### 数据集管理
+`pkg/localcontroller/managers/lifelonglearning/lifelonglearningjob.go`
 
-#### 触发器
+```go
+// LifelongLearningJobManager defines lifelong-learning-job Manager
+type Manager struct {
+   Client                 clienttypes.ClientI
+   WorkerMessageChannel   chan workertypes.MessageContent
+   DatasetManager         *dataset.Manager
+   LifelongLearningJobMap map[string]*Job
+   VolumeMountPrefix      string
+}
+```
 
-### 模型管理
+主要的管理流程可以参考如下`startJob()`代码，其中主要：
 
-minio
+* 监控并处理同步到边缘的Dataset对象，比如监听数据集样本数量是否达到阈值，达到则启动训练。
+* 根据当前任务不同阶段，触发不同阶段的训练、评估、部署任务。本地不直接起任务，而是把对应的状态上报到GM，由GM统一调度来启动对应的训练、评估、部署任务。
+
+`pkg/localcontroller/managers/lifelonglearning/lifelonglearningjob.go`
+
+```go
+// startJob starts a job
+func (lm *Manager) startJob(name string) {
+   ...
+    
+   // 监控并处理同步到边缘的Dataset对象。 
+   go lm.handleData(job)
+
+   tick := time.NewTicker(JobIterationIntervalSeconds * time.Second)
+   for {
+      // 根据当前任务不同阶段，触发不同阶段的训练、评估、部署任务。
+      select {
+      case <-job.JobConfig.Done:
+         return
+      case <-tick.C:
+         cond := lm.getLatestCondition(job)
+         jobStage := cond.Stage
+
+         switch jobStage {
+         case sednav1.LLJobTrain:
+            err = lm.trainTask(job)
+         case sednav1.LLJobEval:
+            err = lm.evalTask(job)
+
+         case sednav1.LLJobDeploy:
+            err = lm.deployTask(job)
+         default:
+            klog.Errorf("invalid phase: %s", jobStage)
+            continue
+         }
+		 ...
+      }
+   }
+}
+```
+
+除了整体的任务流程管理，其他功能还包括数据集的监控、模型的下载、任务本地数据库备份等功能。
 
 ### 消息代理
+
+LC除了把状态变化的消息往云端传之外，还会在本地`0.0.0.0:9100`端口启动一个HTTP Server，用来接收把Lib库传输过来的消息整合并统一传输给GM，起到消息代理的作用。下面是注册的rest接口路由和消息处理函数。
+
+`pkg/localcontroller/server/server.go`
+
+```go
+// register registers api
+func (s *Server) register(container *restful.Container) {
+	ws := new(restful.WebService)
+	ws.Path(fmt.Sprintf("/%s", constants.ServerRootPath)).
+		Consumes(restful.MIME_XML, restful.MIME_JSON).
+		Produces(restful.MIME_JSON, restful.MIME_XML)
+
+	ws.Route(ws.POST("/workers/{worker-name}/info").
+		To(s.messageHandler).
+		Doc("receive worker message"))
+	container.Add(ws)
+}
+```
+
+
+
+`pkg/localcontroller/server/server.go`
+
+```go
+// messageHandler handles message from the worker
+func (s *Server) messageHandler(request *restful.Request, response *restful.Response) {
+   var err error
+   workerName := request.PathParameter("worker-name")
+   workerMessage := workertypes.MessageContent{}
+
+   err = request.ReadEntity(&workerMessage)
+   if workerMessage.Name != workerName || err != nil {
+      var msg string
+      if workerMessage.Name != workerName {
+         msg = fmt.Sprintf("worker name(name=%s) in the api is different from that(name=%s) in the message body",
+            workerName, workerMessage.Name)
+      } else {
+         msg = fmt.Sprintf("read worker(name=%s) message body failed, error: %v", workerName, err)
+      }
+
+      klog.Errorf(msg)
+      err = s.reply(response, http.StatusBadRequest, msg)
+      if err != nil {
+         klog.Errorf("reply messge to worker(name=%s) failed, error: %v", workerName, err)
+      }
+   }
+
+   if m, ok := s.fmm[workerMessage.OwnerKind]; ok {
+      m.AddWorkerMessage(workerMessage)
+   }
+
+   err = s.reply(response, http.StatusOK, "OK")
+   if err != nil {
+      klog.Errorf("reply message to worker(name=%s) failed, error: %v", workerName, err)
+      return
+   }
+}
+```
+
+
+
+
 
 
 # Sedna Lib源码解析（Python）
 
-## 
 
-##
 
 
 
