@@ -357,32 +357,40 @@ make crds
 
 终身学习最主要的控制逻辑在这个`pkg/globalmanager/controllers/lifelonglearning/lifelonglearningjob.go`文件里面，包括训练评估Worker什么时候触发、Worker参数如何同步到边缘等。
 
-在进入到终身学习的控制逻辑之前，我们先看看整体的调用流程：
+在进入到终身学习的控制逻辑之前，整体的调用流程可以参考下面伪代码：
 
 ```go
-cmd/sedna-gm/sedna-gm.go/main()
-manager.go/New() 读取GM配置文件。
-manager.go/Start() 启动GM进程。
-    - clientset.NewForConfig()：调用client-go生成了Sedna CRD client。
-    - NewUpstreamController()：创建UpstreamController，每个GM进程有一个UpstreamController
-    - uc.Run(stopCh)：启动一个for循环协程，来处理
+cmd/sedna-gm/sedna-gm.go/main() 【1】
+pkg/globalmanager/controllers/manager.go/New() 【2】读取GM配置文件。
+pkg/globalmanager/controllers/manager.go/Start() 【3】启动GM进程。
+    - clientset.NewForConfig()：【4】调用client-go生成了Sedna CRD client。
+    - NewUpstreamController()：【5】创建UpstreamController，每个GM进程有一个UpstreamController
+    - uc.Run(stopCh)：【6】启动一个for循环协程，来处理
         - pkg/globalmanager/controllers/upstream.go/syncEdgeUpdate() 
-    - NewRegistry()：注册所有controller。
-        - f.SetDownstreamSendFunc()
-            - pkg/globalmanager/controllers/lifelonglearning/downstream.go
-        - f.SetUpstreamHandler()
-            - pkg/globalmanager/controllers/lifelonglearning/upstream.go/updateFromEdge()
+    - NewRegistry()：【7】注册所有controller。
+        - f.SetDownstreamSendFunc()【8】
+            -> pkg/globalmanager/controllers/lifelonglearning/downstream.go
+        - f.SetUpstreamHandler()【9】
+            -> pkg/globalmanager/controllers/lifelonglearning/upstream.go/updateFromEdge()
         - f.Run()
-    - ws.ListenAndServe()
+    - ws.ListenAndServe() 【10】
 ```
 
+下面为了讲解Sedna LifelongLeraningJob Controller的控制逻辑，也按照上面1~10的标号来讲解：
 
+#### 【1】入口函数
 
 这里的client收到了
 
 ![sednd-crd-client](./images/sednd-crd-client.png)
 
 
+
+#### 【2】加载配置文件
+
+#### 【3】加载配置文件
+
+#### 【4】加载配置文件
 
 ### 消息同步
 
