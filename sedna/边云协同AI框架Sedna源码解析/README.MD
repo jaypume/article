@@ -542,10 +542,6 @@ f.SetUpstreamHandler()
 
 先会通过`WaitForNamedCacheSync`去等待Pod和LifelongLearningJob资源对象是否已经同步到Informer中。如果已经同步，则会启动指定数量的worker对LifelongLearningJob进行处理。
 
-
-
-*首先会通过*`*WaitForNamedCacheSync*`*去等待Pod和StatefulSet资源对象是否已经同步到Pod和StatefulSet Infomer中，如果已经同步过了之后，则会并发的启动指定数量的worker去从queue对statefulset进行处理(默认的并发数量是5, queue里面存储的是statefulset的key, worker会通过该key去cache中获取需要被处理的statefulset对象)。*
-
 `pkg/globalmanager/controllers/lifelonglearning/lifelonglearningjob.go`
 
 ```go
@@ -594,50 +590,19 @@ func (c *Controller) worker() {
 
 ```go
 func (c *Controller) sync(key string) (bool, error) {
-   startTime := time.Now()
-   defer func() {
-      klog.V(4).Infof("Finished syncing lifelonglearning job %q (%v)", key, time.Since(startTime))
-   }()
-
+   //省略了部分代码
    ns, name, err := cache.SplitMetaNamespaceKey(key)
-   if err != nil {
-      return false, err
-   }
-   if len(ns) == 0 || len(name) == 0 {
-      return false, fmt.Errorf("invalid lifelonglearning job key %q: either namespace or name is missing", key)
-   }
-   sharedJob, err := c.jobLister.LifelongLearningJobs(ns).Get(name)
-   if err != nil {
-      if errors.IsNotFound(err) {
-         klog.V(4).Infof("lifelonglearning job has been deleted: %v", key)
-         return true, nil
-      }
-      return false, err
-   }
-   job := *sharedJob
-   // set kind for lifelonglearningjob in case that the kind is None
-   job.SetGroupVersionKind(Kind)
 
-   if job.Status.StartTime == nil {
-      // job is first in
-      now := metav1.Now()
-      job.Status.StartTime = &now
-   }
+   sharedJob, err := c.jobLister.LifelongLearningJobs(ns).Get(name)
 
    // if job was finished previously, we don't want to redo the termination
    if IsJobFinished(&job) {
       return true, nil
    }
 
-   forget := false
-   jobFailed := false
-   needUpdated := false
-
    // transit this job's state machine
    needUpdated, err = c.transitJobState(&job)
-   if err != nil {
-      klog.V(2).Infof("lifelonglearning job %v/%v failed to be updated, err:%s", job.Namespace, job.Name, err)
-   }
+
 
    if needUpdated {
       if err := c.updateJobStatus(&job); err != nil {
@@ -656,7 +621,13 @@ func (c *Controller) sync(key string) (bool, error) {
 }
 ```
 
+sync是对具体的LifelongLearningJob进行逻辑处理了，主要做了这么几件事：
 
+* 通过`SplitMetaNamespaceKey`将LifelongLearningJob的key切分为namespace和name。
+* 通过`c.jobLister`获取LifelongLearningJob的资源对象。
+* 通过`transitJobState`来分析当前job应该进入到训练、评估、部署阶段了。
+* 如果LifelongLearningJob的Status更新了，那么需要通过`c.updateJobStatus()`写回k8s资源对象中，这样通过`kubectl`查询到的就是最新的状态了，比如说当前在评估阶段、生成的模型路径在哪里等信息。
+* 任务失败等异常处理。
 
 ```go
 // transit this job's state machine
