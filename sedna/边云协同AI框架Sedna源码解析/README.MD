@@ -312,9 +312,11 @@ type LLDataset struct {
 
 上面的代码片段中，补充了额外的说明，需要注意的有如下几点：
 
-- `// +kubebuilder...` 的注释是给kubebuilder等代码自动生成工具的配置参数，会被这些工具解析。
-- `type LifelongLearningJob struct{...}`定义了终身学习CRD整体API，主要包含Spec和Status定义，分别代表期望状态和实际状态。
-- `type LLJobSpec struct {...}`在创建LifelongLearningJob CR时需要配置的参数；如果需要扩展终身学习字段的接口，可以在这里修改。
+| 代码片段                               | 说明                                                         |
+| -------------------------------------- | ------------------------------------------------------------ |
+| `// +kubebuilder...`                   | 注释是给kubebuilder等代码自动生成工具的配置参数，会被这些工具解析。 |
+| `type LifelongLearningJob struct{...}` | 定义了终身学习CRD整体API，主要包含Spec和Status定义，分别代表期望状态和实际状态。 |
+| `type LLJobSpec struct {...}`          | 在创建LifelongLearningJob CR时需要配置的参数；如果需要扩展终身学习字段的接口，可以在这里修改。 |
 
 其他协同推理、增量学习、联邦学习相关的API定义都可以在`pkg/apis/sedna/v1alpha1/`这个目录下找到。
 
