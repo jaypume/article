@@ -365,15 +365,15 @@ pkg/globalmanager/controllers/manager.go/New() 【2】读取GM配置文件。
 pkg/globalmanager/controllers/manager.go/Start() 【3】启动GM进程。
     - clientset.NewForConfig()：【4】调用client-go生成了Sedna CRD client。
     - NewUpstreamController()：【5】创建UpstreamController，每个GM进程有一个UpstreamController
-    - uc.Run(stopCh)：【6】启动一个for循环协程，来处理
+    - uc.Run(stopCh)：启动一个for循环协程，来处理
         - pkg/globalmanager/controllers/upstream.go/syncEdgeUpdate() 
-    - NewRegistry()：【7】注册所有controller。
-        - f.SetDownstreamSendFunc()【8】
+    - NewRegistry()：【6】注册所有controller。
+        - f.SetDownstreamSendFunc()【7】
             -> pkg/globalmanager/controllers/lifelonglearning/downstream.go
-        - f.SetUpstreamHandler()【9】
+        - f.SetUpstreamHandler()【8】
             -> pkg/globalmanager/controllers/lifelonglearning/upstream.go/updateFromEdge()
-        - f.Run()【10】
-    - ws.ListenAndServe() 【11】
+        - f.Run()【9】
+    - ws.ListenAndServe() 【10】
 ```
 
 下面为了讲解Sedna LifelongLeraningJob Controller的控制逻辑，也按照上面1~10的标号来讲解：
@@ -398,7 +398,7 @@ func main() {
 }
 ```
 
-#### 【2】GM加载系统配置
+#### 【2】GM系统配置加载
 
 GM加载系统配置，包括K8S集群配置、启动监听的Websocket地址端口、KB服务的地址等。
 
@@ -488,7 +488,7 @@ func (m *Manager) Start() error {
 }
 ```
 
-#### 【4】初始化Sedna CRD client
+#### 【4】CRD client初始化
 
 调用的原始函数位于`pkg/client/clientset/versioned/clientset.go`，前面提到这里是由client-go工具根据Sedna CRD定义自动生成的代码，方便
 
@@ -506,7 +506,7 @@ clientset.NewForConfig()：
 
 
 
-#### 【5】初始化消息处理循环
+#### 【5】消息处理初始化
 
 UpstreamController
 
@@ -538,11 +538,140 @@ f.SetUpstreamHandler()
 
 #### 【9】Controller核心处理逻辑
 
-f.Run()
+`f.run()`会调用各个特性对应Controller的处理函数，下面是LifelongLearningJob的`run()`函数。
 
-#### 【10】启动websocket监听
+先会通过`WaitForNamedCacheSync`去等待Pod和LifelongLearningJob资源对象是否已经同步到Informer中。如果已经同步，则会启动指定数量的worker对LifelongLearningJob进行处理。
 
-#### ws.ListenAndServe() 
+
+
+*首先会通过*`*WaitForNamedCacheSync*`*去等待Pod和StatefulSet资源对象是否已经同步到Pod和StatefulSet Infomer中，如果已经同步过了之后，则会并发的启动指定数量的worker去从queue对statefulset进行处理(默认的并发数量是5, queue里面存储的是statefulset的key, worker会通过该key去cache中获取需要被处理的statefulset对象)。*
+
+`pkg/globalmanager/controllers/lifelonglearning/lifelonglearningjob.go`
+
+```go
+// Run starts the main goroutine responsible for watching and syncing jobs.
+func (c *Controller) Run(stopCh <-chan struct{}) {
+   workers := 1
+
+   defer utilruntime.HandleCrash()
+   defer c.queue.ShutDown()
+
+   klog.Infof("Starting %s controller", Name)
+   defer klog.Infof("Shutting down %s controller", Name)
+
+   if !cache.WaitForNamedCacheSync(Name, stopCh, c.podStoreSynced, c.jobStoreSynced) {
+      klog.Errorf("failed to wait for %s caches to sync", Name)
+
+      return
+   }
+   klog.Infof("Starting %s workers", Name)
+   for i := 0; i < workers; i++ {
+      go wait.Until(c.worker, time.Second, stopCh)
+   }
+
+   <-stopCh
+}
+```
+
+在`c.worker`方法中，会调用`processNextWorkItem()`去处理对应的LifelongLearningJob资源对象，
+
+`pkg/globalmanager/controllers/lifelonglearning/lifelonglearningjob.go`
+
+```go
+// worker runs a worker thread that just dequeues items, processes them, and marks them done.
+// It enforces that the syncHandler is never invoked concurrently with the same key.
+func (c *Controller) worker() {
+   for c.processNextWorkItem() {
+   }
+}
+```
+
+
+
+`c.processNextWorkItem()`会调用`c.sync()`函数来处理特性相关的逻辑。
+
+`pkg/globalmanager/controllers/lifelonglearning/lifelonglearningjob.go`
+
+```go
+func (c *Controller) sync(key string) (bool, error) {
+   startTime := time.Now()
+   defer func() {
+      klog.V(4).Infof("Finished syncing lifelonglearning job %q (%v)", key, time.Since(startTime))
+   }()
+
+   ns, name, err := cache.SplitMetaNamespaceKey(key)
+   if err != nil {
+      return false, err
+   }
+   if len(ns) == 0 || len(name) == 0 {
+      return false, fmt.Errorf("invalid lifelonglearning job key %q: either namespace or name is missing", key)
+   }
+   sharedJob, err := c.jobLister.LifelongLearningJobs(ns).Get(name)
+   if err != nil {
+      if errors.IsNotFound(err) {
+         klog.V(4).Infof("lifelonglearning job has been deleted: %v", key)
+         return true, nil
+      }
+      return false, err
+   }
+   job := *sharedJob
+   // set kind for lifelonglearningjob in case that the kind is None
+   job.SetGroupVersionKind(Kind)
+
+   if job.Status.StartTime == nil {
+      // job is first in
+      now := metav1.Now()
+      job.Status.StartTime = &now
+   }
+
+   // if job was finished previously, we don't want to redo the termination
+   if IsJobFinished(&job) {
+      return true, nil
+   }
+
+   forget := false
+   jobFailed := false
+   needUpdated := false
+
+   // transit this job's state machine
+   needUpdated, err = c.transitJobState(&job)
+   if err != nil {
+      klog.V(2).Infof("lifelonglearning job %v/%v failed to be updated, err:%s", job.Namespace, job.Name, err)
+   }
+
+   if needUpdated {
+      if err := c.updateJobStatus(&job); err != nil {
+         return forget, err
+      }
+
+      if jobFailed && !IsJobFinished(&job) {
+         // returning an error will re-enqueue LifelongLearningJob after the backoff period
+         return forget, fmt.Errorf("failed pod(s) detected for lifelonglearningjob key %q", key)
+      }
+
+      forget = true
+   }
+
+   return forget, err
+}
+```
+
+
+
+```go
+// transit this job's state machine
+needUpdated, err = c.transitJobState(&job)
+```
+
+其中`transitJobState()`是终身学习任务流转的核心逻辑，包括训练、评估、部署分别在什么时候启动、停止等的控制，详细流转逻辑可以结合下图对应的状态流转图进行分析。
+
+![](./images/incremental-learning-state-machine.png)
+
+
+
+
+
+#### 【10】websocket监听启动
 
 
 
@@ -625,3 +754,4 @@ minio
 
 
 [^1]: https://www.redhat.com/en/topics/containers/what-is-a-kubernetes-operator
+[^2]: 
