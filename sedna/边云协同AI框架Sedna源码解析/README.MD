@@ -1,4 +1,4 @@
-# Sedna概述
+# KubeEdge-Sedna概述
 
 Sedna是在KubeEdge SIG AI中孵化的一个边云协同AI项目。得益于KubeEdge提供的边云协同能力，Sedna可以实现跨边云的协同训练和协同推理能力，如联合推理、增量学习、联邦学习、终身学习等。Sedna支持目前广泛使用的AI框架，如TensorFlow/Pytorch/MindSpore等，现有AI类应用可以无缝迁移到Sedna, 快速实现边云协同的训练和推理，可在降低成本、提升模型性能、保护数据隐私等方面获得提升。
 
@@ -450,7 +450,7 @@ type ControllerConfig struct {
 
 #### 【3】GM整体初始化
 
-GM整体的初始化步骤如下，包括初始化Sedna CRD client、
+GM整体初始化的步骤如下，包括初始化Sedna CRD client、绑定并启动边云消息通信处理函数、启动各个特定对应的controller、启动websock开始监听消息。
 
 `pkg/globalmanager/controllers/manager.go`
 
@@ -482,7 +482,7 @@ func (m *Manager) Start() error {
 
    ...
 
-   // 启动整体GM的websocket，默认监听在0.0.0.0:10004这个端口地址
+   // 启动整体GM的websocket，默认监听在0.0.0.0:9000这个端口地址
    ws := websocket.NewServer(addr)
    ...
 }
@@ -490,17 +490,74 @@ func (m *Manager) Start() error {
 
 #### 【4】CRD client初始化
 
-调用的原始函数位于`pkg/client/clientset/versioned/clientset.go`，前面提到这里是由client-go工具根据Sedna CRD定义自动生成的代码，方便
+`clientset.NewForConfig()`调用的原始函数位于`pkg/client/clientset/versioned/clientset.go`，前面提到这里是由client-go工具根据Sedna CRD定义自动生成的代码，通过go语言调用CRD定义的资源对象的增删改查。
+
+下面代码是LifelongLearningJob Controller初始化的函数，其中就依赖client-go生成的CRD client代码。主要做了这么几件事：
+
+* 获取LifelongLearningJob的Informer。Informer可以看作是controller的K8S api-server的”本地缓存“，用来减少api-server的数据读取压力。
+
+* 配置LifelongLearningJob Controller的参数或成员变量，包括k8s client、sedna client、GM controller通用配置。
+
+* 绑定LifelongLearningJob CRD资源的Add、Update、Delete对应事件的回调函数。
+
+`pkg/globalmanager/controllers/lifelonglearning/lifelonglearningjob.go`
+
+```go
+// New creates a new LifelongLearningJob controller that keeps the relevant pods
+// in sync with their corresponding LifelongLearningJob objects.
+func New(cc *runtime.ControllerContext) (runtime.FeatureControllerI, error) {
+   cfg := cc.Config
+
+   podInformer := cc.KubeInformerFactory.Core().V1().Pods()
+
+   // 获取LifelongLearningJob的Informer
+   jobInformer := cc.SednaInformerFactory.Sedna().V1alpha1().LifelongLearningJobs()
+
+   eventBroadcaster := record.NewBroadcaster()
+   eventBroadcaster.StartRecordingToSink(&v1core.EventSinkImpl{Interface: cc.KubeClient.CoreV1().Events("")})
+
+   // 配置LifelongLearningJob Controller的参数
+   jc := &Controller{
+      kubeClient: cc.KubeClient,
+      client:     cc.SednaClient.SednaV1alpha1(),
+      queue:      workqueue.NewNamedRateLimitingQueue(workqueue.NewItemExponentialFailureRateLimiter(runtime.DefaultBackOff, runtime.MaxBackOff), Name),
+      cfg:        cfg,
+   }
+
+   // 绑定LifelongLearningJob CRD资源的Add、Update、Delete对应事件的回调函数。
+   jobInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+      AddFunc: func(obj interface{}) {
+         jc.enqueueController(obj, true)
+         jc.syncToEdge(watch.Added, obj)
+      },
+      UpdateFunc: func(old, cur interface{}) {
+         jc.enqueueController(cur, true)
+         jc.syncToEdge(watch.Added, cur)
+      },
+      DeleteFunc: func(obj interface{}) {
+         jc.enqueueController(obj, true)
+         jc.syncToEdge(watch.Deleted, obj)
+      },
+   })
+   jc.jobLister = jobInformer.Lister()
+   jc.jobStoreSynced = jobInformer.Informer().HasSynced
+
+   // 绑定Pod对应的增删改对应事件的回调函数。
+   podInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+      AddFunc:    jc.addPod,
+      UpdateFunc: jc.updatePod,
+      DeleteFunc: jc.deletePod,
+   })
+   jc.podStore = podInformer.Lister()
+   jc.podStoreSynced = podInformer.Informer().HasSynced
+
+   return jc, nil
+}
+```
 
 
 
-pkg/globalmanager/controllers/lifelonglearning/lifelonglearningjob.go/addJobAnnotations()中会更新LifelongLearningJobs的状态，
-
-
-
-clientset.NewForConfig()：
-
-这里的client收到了
+下面截图也展示了Sedna CRD client在其他模块的一些引用。
 
 ![sednd-crd-client](./images/sednd-crd-client.png)
 
@@ -508,33 +565,187 @@ clientset.NewForConfig()：
 
 #### 【5】消息处理初始化
 
-UpstreamController
+`uc.Run()`里面会初始化UpstreamController，UpstreamController用来处理边缘发送过来的所有消息。
 
-每个GM进程有一个UpstreamController
+for循环持续的监听`context.upstreamChannel`， 一旦有消息则通过`uc.updateHandlers[kind]`根据kind类型获取对应的handler，并调用此handler回调函数进行消息处理。`uc.updateHandlers`是一个map，里面存储了协同推理、增量学习、联邦学习、终身学习对应的updateHandlers.
 
-NewUpstreamController()：
+`pkg/globalmanager/controllers/upstream.go`
 
-启动一个for循环协程，来处理
+```go
+// syncEdgeUpdate receives the updates from edge and syncs these to k8s.
+func (uc *UpstreamController) syncEdgeUpdate() {
+   for {
+      select {
+      case <-uc.messageLayer.Done():
+         klog.Info("Stop sedna upstream loop")
+         return
+      default:
+      }
 
-uc.Run(stopCh)：
+      update, err := uc.messageLayer.ReceiveResourceUpdate()
+	  ...
 
-- pkg/globalmanager/controllers/upstream.go/syncEdgeUpdate() 
+      handler, ok := uc.updateHandlers[kind]
+      if ok {
+         err := handler(name, namespace, operation, update.Content)
+         ...
+      }
+   }
+}
+```
+`ReceiveFromEdge`提供一个阻塞的通道，来接收来自边缘节点LC发送的消息，消息的类型为`nodeMessage`。
+
+`pkg/globalmanager/messagelayer/ws/context.go`
+
+```go
+// ReceiveResourceUpdate receives and handles the update
+func (cml *ContextMessageLayer) ReceiveResourceUpdate() (*ResourceUpdateSpec, error) {
+   nodeName, msg, err := wsContext.ReceiveFromEdge()
+   ...
+}
+```
 
 #### 【6】Controller注册
 
-NewRegistry()：
+`NewRegistry()`函数注册了所有特性初始化函数，如果想扩展新的边云协同特性，需要在这里添加对应的New函数。
 
-#### 【7】云端处理逻辑
+`pkg/globalmanager/controllers/registry.go`
 
-f.SetDownstreamSendFunc()
+```go
+func NewRegistry() Registry {
+   return Registry{
+      ji.Name:      ji.New,
+      fe.Name:      fe.New,
+      fl.Name:      fl.New,
+      il.Name:      il.New,
+      ll.Name:      ll.New,
+      reid.Name:    reid.New,
+      va.Name:      va.New,
+      dataset.Name: dataset.New,
+      objs.Name:    objs.New,
+   }
+}
+```
 
--> pkg/globalmanager/controllers/lifelonglearning/downstream.go
+#### 【7】云端消息同步到边缘
 
-#### 【8】边缘消息同步
+`f.SetDownstreamSendFunc()`绑定了各个特性对应的边缘同步消息函数`syncToEdge()`。
 
-f.SetUpstreamHandler()
+对于终身学习来说，其同步消息的步骤主要包括：
 
--> pkg/globalmanager/controllers/lifelonglearning/upstream.go/updateFromEdge()
+* 获取到对应的数据集指定的节点，Dataset CRD对象中有一个字段记录了Node名称）。
+* 获取到训练、评估、部署对应的节点名称，这些名称基于Annotation记录。
+* 根据LifelongLearningJob所处训练、评估、部署阶段不同，发送消息到不同的节点上。
+
+`pkg/globalmanager/controllers/lifelonglearning/downstream.go`
+
+```go
+func (c *Controller) syncToEdge(eventType watch.EventType, obj interface{}) error {
+
+   // 获取到对应的数据集指定的节点（Dataset CRD对象中有一个字段记录了Node名称）
+   ds, err := c.client.Datasets(job.Namespace).Get(context.TODO(), dataName, metav1.GetOptions{})
+   
+   // 获取到训练、评估、部署对应的节点名称
+   getAnnotationsNodeName := func(nodeName sednav1.LLJobStage) string {
+      return runtime.AnnotationsKeyPrefix + string(nodeName)
+   }
+   ann := job.GetAnnotations()
+   if ann != nil {
+      trainNodeName = ann[getAnnotationsNodeName(sednav1.LLJobTrain)]
+      evalNodeName = ann[getAnnotationsNodeName(sednav1.LLJobEval)]
+      deployNodeName = ann[getAnnotationsNodeName(sednav1.LLJobDeploy)]
+   }
+   
+   ...
+
+   // 根据LifelongLearningJob所处阶段不同，发送消息到不同的节点上
+   switch jobStage {
+   case sednav1.LLJobTrain:
+      doJobStageEvent(trainNodeName)
+   case sednav1.LLJobEval:
+      doJobStageEvent(evalNodeName)
+   case sednav1.LLJobDeploy:
+      doJobStageEvent(deployNodeName)
+   }
+
+   return nil
+}
+```
+
+#### 【8】边缘消息同步到云端
+
+`f.SetUpstreamHandler()` 绑定了各个特性对应的云端消息消息同步函数`updateFromEdge()`。
+
+对于终身学习来说，其同步消息主要做了几件事：
+
+* 根据不同的边缘节点任务完成情况，变更当前LifelongLearningJob的整体状态。
+* 将当前LifelongLearningJob的整体状态写回k8s，也就是LifelongLearningJob这个CR的Status字段。
+* 解析边缘消息结构体，当前是以json的形式定义的，消息体示例如下：
+
+GM接收到的消息体示例：
+
+```json
+{
+    "phase": "train",
+    "status": "completed",
+    "output": {
+        "models": [{
+            "classes":  ["road", "fence"],
+            "current_metric": null,
+            "format": "pkl",
+            "metrics": null,
+            "url": "/output/train/1/index.pkl"
+        }],
+        "ownerInfo": null
+    }
+}
+
+```
+
+`pkg/globalmanager/controllers/lifelonglearning/upstream.go`
+
+```go
+// updateFromEdge syncs the edge updates to k8s
+func (c *Controller) updateFromEdge(name, namespace, operation string, content []byte) error {
+   var jobStatus struct {
+      Phase  string `json:"phase"`
+      Status string `json:"status"`
+   }
+   
+   // 把边缘消息结构体进行解析。
+   err := json.Unmarshal(content, &jobStatus)
+   ...
+   cond := sednav1.LLJobCondition{
+      Status:             v1.ConditionTrue,
+      LastHeartbeatTime:  metav1.Now(),
+      LastTransitionTime: metav1.Now(),
+      Data:               string(condDataBytes),
+      Message:            "reported by lc",
+   }
+
+   // 根据不同的边缘节点任务状态实现，变更当前LifelongLearningJob的整体状态
+   switch strings.ToLower(jobStatus.Status) {
+   case "ready":
+      cond.Type = sednav1.LLJobStageCondReady
+   case "completed":
+      cond.Type = sednav1.LLJobStageCondCompleted
+   case "failed":
+      cond.Type = sednav1.LLJobStageCondFailed
+   case "waiting":
+      cond.Type = sednav1.LLJobStageCondWaiting
+   default:
+      return fmt.Errorf("invalid condition type: %v", jobStatus.Status)
+   }
+
+   // 将当前LifelongLearningJob的整体状态写回k8s，也就是LifelongLearningJob这个CR的Status字段。
+   err = c.appendStatusCondition(name, namespace, cond)
+   ...
+}
+```
+
+
+
+
 
 #### 【9】Controller核心处理逻辑
 
@@ -644,57 +855,15 @@ needUpdated, err = c.transitJobState(&job)
 
 #### 【10】websocket监听启动
 
+启动一个websocket地址，用于接收【8】中提到的边侧传过来的消息，默认启动的IP端口是`0.0.0.0:9000`。
 
-
-#### 
-
-### 消息同步
-
-for循环持续的监听`upstreamChannel`， 一旦有消息则通过`uc.updateHandlers[kind]`根据kind类型获取对应的handler。`uc.updateHandlers`是一个map，里面存储了协同推理、增量学习、联邦学习、终身学习对应的updateHandlers.
-
-```
-// syncEdgeUpdate receives the updates from edge and syncs these to k8s.
-func (uc *UpstreamController) syncEdgeUpdate() {
-   for {
-      select {
-      case <-uc.messageLayer.Done():
-         klog.Info("Stop sedna upstream loop")
-         return
-      default:
-      }
-
-      update, err := uc.messageLayer.ReceiveResourceUpdate()
-	  ...
-
-      handler, ok := uc.updateHandlers[kind]
-      if ok {
-         err := handler(name, namespace, operation, update.Content)
-         ...
-      }
-   }
-}
-```
+`pkg/globalmanager/controllers/manager.go`
 
 ```go
-// ReceiveResourceUpdate receives and handles the update
-func (cml *ContextMessageLayer) ReceiveResourceUpdate() (*ResourceUpdateSpec, error) {
-   nodeName, msg, err := wsContext.ReceiveFromEdge()
-   ...
-}
-```
+addr := fmt.Sprintf("%s:%d", m.Config.WebSocket.Address, m.Config.WebSocket.Port)
 
-`ReceiveFromEdge`提供一个阻塞的通道，来接收来自边缘节点LC发送的消息，消息的类型为`nodeMessage`。
-
-`pkg/globalmanager/messagelayer/ws/context.go`
-
-```go
-// ReceiveFromEdge receives a message from edge
-func ReceiveFromEdge() (nodeName string, msg model.Message, err error) {
-	nodeMsg := <-context.upstreamChannel
-	nodeName = nodeMsg.nodeName
-	msg = nodeMsg.msg
-	return
-}
+ws := websocket.NewServer(addr)
+err = ws.ListenAndServe()
 ```
 
 
